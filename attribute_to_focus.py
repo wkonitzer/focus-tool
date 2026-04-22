@@ -36,7 +36,7 @@ custom columns (`x_CustomerName`, `x_CustomerRuleIdentifier`,
 
 Dependencies
 ------------
-    pip install requests
+    pip install requests pyarrow
 """
 
 from __future__ import annotations
@@ -50,6 +50,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Iterator, Optional
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
 
@@ -335,7 +337,9 @@ def entries_to_focus_rows(
                 "BillingPeriodStart": billing_period_start,
                 "ChargeCategory":     "Usage",
                 "ChargeClass":        "",   # null: not a correction
-                "ChargeDescription":  f"{service_name} usage attributed to customer '{customer_name}'",
+                "ChargeDescription":  (
+                    f"{service_name} usage attributed to customer '{customer_name}'"
+                ),
                 "ChargePeriodEnd":    billing_period_end,
                 "ChargePeriodStart":  billing_period_start,
                 "ContractedCost":     amortized,  # Attribute does not distinguish
@@ -390,13 +394,20 @@ def write_jsonl(rows: Iterable[dict[str, Any]], out_path: str) -> int:
     return count
 
 
+def write_parquet(rows: Iterable[dict[str, Any]], out_path: str) -> int:
+    materialized = list(rows)
+    table = pa.Table.from_pylist(materialized)
+    pq.write_table(table, out_path)
+    return len(materialized)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Convert Attribute API customer-attribution data into FOCUS v1.3 billing format.",
+        description="Convert Attribute API customer-attribution data into FOCUS v1.3 billing format."
     )
     p.add_argument("--date", required=True,
                    help="Date in YYYY-MM-DD. For --granularity monthly, the day part is ignored.")
@@ -413,9 +424,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="JWT token. Defaults to ATTRIBUTE_API_TOKEN env var.")
     p.add_argument("--currency", default=DEFAULT_CURRENCY,
                    help=f"Billing currency ISO-4217 code (default: {DEFAULT_CURRENCY}).")
-    p.add_argument("--out", default="focus.csv",
-                   help="Output file path (default: focus.csv).")
-    p.add_argument("--format", choices=("csv", "jsonl"), default="csv")
+    p.add_argument("--out", default=None,
+                   help=(
+                       "Output file path (default depends on --format: "
+                       "focus.csv, focus.jsonl, or focus.parquet)."
+                    )
+    )
+    p.add_argument("--format", choices=("csv", "jsonl", "parquet"), default="csv")
     p.add_argument("--page-size", type=int, default=500,
                    help="Page size for /fetch pagination (default: 500).")
     p.add_argument("--poll-interval", type=float, default=3.0,
@@ -427,6 +442,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    default_out_by_format = {
+        "csv": "focus.csv",
+        "jsonl": "focus.jsonl",
+        "parquet": "focus.parquet",
+    }
+    if args.out is None:
+        args.out = default_out_by_format[args.format]    
 
     if not args.token:
         print("ERROR: provide --token or set ATTRIBUTE_API_TOKEN.", file=sys.stderr)
@@ -464,8 +487,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.format == "csv":
             n = write_csv(rows, args.out)
-        else:
+        elif args.format == "jsonl":
             n = write_jsonl(rows, args.out)
+        else:
+            n = write_parquet(rows, args.out)
 
     except AttributeAPIError as e:
         print(f"API error: {e}", file=sys.stderr)

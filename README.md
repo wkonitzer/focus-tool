@@ -45,7 +45,7 @@ Start the RSS server:
 ```shell
 export ATTRIBUTE_API_TOKEN=<your-jwt>
 python3 attribute_to_focus.py --date 2026-04-15 --granularity daily --out focus.csv
-ython3 attribute_to_focus.py --date 2026-04-01 --granularity monthly --format jsonl --out focus.jsonl
+ython3 attribute_to_focus.py --date 2026-04-01 --granularity monthly --format parquet
 ```
 
 ## Mapping

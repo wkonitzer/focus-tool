@@ -427,6 +427,7 @@ class AttributeClient:
 
     def start_customer_job(
         self,
+        source: str,
         granularity: str,
         date: str,
         account: Optional[str] = None,
@@ -436,11 +437,20 @@ class AttributeClient:
 
         The Attribute API uses GET to kick off a job; we follow that here.
         """
-        data = self._get(
-            f"/api/v1/customer/{granularity}/{date}",
-            account=account,
-            allcustomers=("true" if allcustomers else None),
-        )
+        source = (source or "customer").strip().lower()
+        if source == "customer":
+            path = f"/api/v1/customer/{granularity}/{date}"
+            params = {
+                "account": account,
+                "allcustomers": ("true" if allcustomers else None),
+            }
+        elif source in {"resources", "workloads"}:
+            path = f"/api/v1/reports/{source}/{granularity}/{date}"
+            params = {}
+        else:
+            raise ValueError(f"Unsupported source: {source!r}")
+
+        data = self._get(path, **params)
         job_id = data.get("id")
         if not job_id:
             raise AttributeAPIError(f"No job id in response: {data!r}")
@@ -494,9 +504,74 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def extract_source_entries(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract a page of result entries from a fetch payload."""
+    results = data.get("results")
+    if isinstance(results, list):
+        return results
+
+    # Some report endpoints may return their page payload under different keys.
+    for key in ("data", "items", "entries"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+
+    return []
+
+
+def get_next_token(data: dict[str, Any]) -> Optional[Any]:
+    """Return the pagination token from a fetch payload if present."""
+    for key in ("nextToken", "next_token", "token"):
+        value = data.get(key)
+        if value:
+            return value
+    return None
+
+
+def iter_entry_items(entry: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Yield report items from customer/resources/workloads entry shapes."""
+    data_items = entry.get("data")
+    if isinstance(data_items, list):
+        for item in data_items:
+            if isinstance(item, dict):
+                yield item
+        return
+
+    # Some endpoints may already return a single item per top-level entry.
+    if isinstance(entry.get("resource"), dict) or isinstance(entry.get("cost"), dict):
+        yield entry
+        return
+
+    for key in ("results", "items", "resources", "workloads"):
+        nested = entry.get(key)
+        if isinstance(nested, list):
+            for item in nested:
+                if isinstance(item, dict):
+                    yield item
+            return
+
+
+def derive_charge_description(
+    source: str,
+    service_name: str,
+    customer_name: str,
+    workload_name: str,
+    resource_name: str,
+) -> str:
+    """Build a human-readable charge description by source type."""
+    if source == "customer" and customer_name:
+        return f"{service_name} usage attributed to customer '{customer_name}'"
+    if source == "workloads" and workload_name:
+        return f"{service_name} usage attributed to workload '{workload_name}'"
+    if source == "resources" and resource_name:
+        return f"{service_name} usage for resource '{resource_name}'"
+    return f"{service_name} usage"
+
+
 def entries_to_focus_rows(
     entries: Iterable[dict[str, Any]],
     *,
+    source: str,
     billing_period_start: str,
     billing_period_end: str,
     currency: str,
@@ -508,37 +583,54 @@ def entries_to_focus_rows(
     if debug_log is None:
         debug_log = lambda _msg: None
 
+    normalized_source = (source or "customer").strip().lower()
+
     for entry in entries:
         customer_name = str(entry.get("customerName") or "")
         organization_id = str(entry.get("organizationId") or "")
-        entry_data = entry.get("data") or []
+        workload_name = str(
+            entry.get("workloadName")
+            or entry.get("name")
+            or entry.get("workload")
+            or ""
+        )
+        entry_items = list(iter_entry_items(entry))
 
         if debug:
             debug_log(
                 f"DEBUG entry customer={customer_name!r} organization_id={organization_id!r} "
-                f"data_len={len(entry_data)} keys={sorted(entry.keys())}"
+                f"workload_name={workload_name!r} item_len={len(entry_items)} "
+                f"keys={sorted(entry.keys())}"
             )
-            if not entry_data:
-                debug_log(
-                    f"DEBUG entry has no data items for customer={customer_name!r}"
-                )
+            if not entry_items:
+                debug_log("DEBUG entry has no convertible items")
 
-        for item in entry_data:
+        for item in entry_items:
             resource = item.get("resource") or {}
             cost = item.get("cost") or {}
+            if not resource and isinstance(item.get("resourceData"), dict):
+                resource = item.get("resourceData") or {}
+            if not cost and isinstance(item.get("costData"), dict):
+                cost = item.get("costData") or {}
 
-            amortized = _to_float(cost.get("amortizedCost"))
+            amortized = _to_float(
+                cost.get("amortizedCost")
+                or item.get("amortizedCost")
+                or item.get("cost")
+            )
 
             if debug:
                 debug_log(
                     "DEBUG item "
                     f"resource_type={resource.get('resourceType')!r} "
                     f"resource_name={resource.get('resourceName')!r} "
-                    f"provider={resource.get('cloudProvider')!r} "
-                    f"amortized_cost={cost.get('amortizedCost')!r}"
+                    f"provider={resource.get('cloudProvider') or item.get('cloudProvider')!r} "
+                    f"amortized_cost={cost.get('amortizedCost') or item.get('amortizedCost')!r}"
                 )
 
-            provider = normalize_provider(resource.get("cloudProvider"))
+            provider = normalize_provider(
+                resource.get("cloudProvider") or item.get("cloudProvider")
+            )
             if provider_filter and provider != provider_filter:
                 if debug:
                     debug_log(
@@ -547,17 +639,31 @@ def entries_to_focus_rows(
                     )
                 continue
 
-            resource_name = str(resource.get("resourceName") or "")
-            resource_type = str(resource.get("resourceType") or "")
-            rule_id = str(resource.get("customerRuleIdentifier") or "")
+            resource_name = str(
+                resource.get("resourceName")
+                or item.get("resourceName")
+                or workload_name
+                or ""
+            )
+            resource_type = str(
+                resource.get("resourceType")
+                or item.get("resourceType")
+                or entry.get("resourceType")
+                or ""
+            )
+            rule_id = str(
+                resource.get("customerRuleIdentifier")
+                or item.get("customerRuleIdentifier")
+                or ""
+            )
 
             service_category, service_name = classify_service(
                 provider,
                 resource_type,
                 resource_name,
             )
-            account_fields = map_account_fields(provider, resource)
-            resource_fields = map_resource_fields(provider, resource)
+            account_fields = map_account_fields(provider, resource or item)
+            resource_fields = map_resource_fields(provider, resource or item)
 
             yield {
                 # Mandatory
@@ -568,8 +674,12 @@ def entries_to_focus_rows(
                 "BillingPeriodStart": billing_period_start,
                 "ChargeCategory":     "Usage",
                 "ChargeClass":        "",   # null: not a correction
-                "ChargeDescription":  (
-                    f"{service_name} usage attributed to customer '{customer_name}'"
+                "ChargeDescription": derive_charge_description(
+                    normalized_source,
+                    service_name,
+                    customer_name,
+                    workload_name,
+                    resource_fields.get("ResourceName") or resource_name,
                 ),
                 "ChargePeriodEnd":    billing_period_end,
                 "ChargePeriodStart":  billing_period_start,
@@ -651,8 +761,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None,
                    help=(
                        "Output file path (default depends on --format: "
-                       "focus.csv, focus.jsonl, or focus.parquet)."
-                    )
+                       "focus.csv, focus.jsonl, or focus.parquet).")
     )
     p.add_argument("--format", choices=("csv", "jsonl", "parquet"), default="csv")
     p.add_argument("--page-size", type=int, default=500,
@@ -666,9 +775,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--provider", choices=("aws", "gcp", "azure", "all"), default="all",
                    help=(
                        "Filter output to a single cloud provider or include all providers "
-                       "(default: all)."
-                    )
-    )    
+                       "(default: all).")
+    )
+    p.add_argument("--source", choices=("customer", "resources", "workloads"),
+                   default="customer",
+                   help=(
+                       "Attribute source endpoint to query (default: customer). "
+                       "Use resources for a more resource-native FOCUS export or workloads "
+                       "for workload-attributed output.")
+    )
     return p
 
 
@@ -700,8 +815,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     try:
-        print("Starting customer-data job...", file=sys.stderr)
+        print("Starting data job...", file=sys.stderr)
         job_id = client.start_customer_job(
+            source=args.source,
             granularity=args.granularity,
             date=args.date,
             account=args.account,
@@ -740,6 +856,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         rows = entries_to_focus_rows(
             entries,
+            source=args.source,
             billing_period_start=start,
             billing_period_end=end,
             currency=args.currency,

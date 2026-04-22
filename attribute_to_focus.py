@@ -14,6 +14,7 @@ Usage
     export ATTRIBUTE_API_TOKEN=<your-jwt>
     python attribute_to_focus.py --date 2024-12-04 --granularity daily --out focus.csv
     python attribute_to_focus.py --date 2024-11-01 --granularity monthly --format jsonl --out focus.jsonl
+    python attribute_to_focus.py --date 2024-11-01 --granularity monthly --format parquet --out focus.parquet
 
 Mapping notes & caveats
 -----------------------
@@ -45,6 +46,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -62,6 +64,8 @@ JOB_COMPLETED = "completed"
 JOB_FAILED = "failed"
 JOB_IN_PROGRESS = {"pending", "running"}
 
+DEFAULT_CATEGORY = "Other"
+DEFAULT_SUBACCOUNT_TYPE = "Project"
 
 # ---------------------------------------------------------------------------
 # FOCUS v1.3 schema
@@ -111,52 +115,234 @@ FOCUS_COLUMNS: list[str] = [
 ]
 
 
-# Minimal mapping from AWS resource types to FOCUS-defined (ServiceCategory,
-# ServiceName) tuples. FOCUS v1.3 defines a fixed set of ServiceCategory
-# values (see spec §3.1.55). Extend this table to cover the resource types
-# produced by your Attribute integration.
-RESOURCE_TYPE_MAP: dict[str, tuple[str, str]] = {
-    # resource_type  ->  (ServiceCategory, ServiceName)
-    "EC2":             ("Compute", "Amazon Elastic Compute Cloud"),
-    "EKS":             ("Compute", "Amazon Elastic Kubernetes Service"),
-    "ECS":             ("Compute", "Amazon Elastic Container Service"),
-    "Lambda":          ("Compute", "AWS Lambda"),
-    "Fargate":         ("Compute", "AWS Fargate"),
-    "S3":              ("Storage", "Amazon Simple Storage Service"),
-    "EBS":             ("Storage", "Amazon Elastic Block Store"),
-    "EFS":             ("Storage", "Amazon Elastic File System"),
-    "RDS":             ("Databases", "Amazon Relational Database Service"),
-    "DynamoDB":        ("Databases", "Amazon DynamoDB"),
-    "ElastiCache":     ("Databases", "Amazon ElastiCache"),
-    "Redshift":        ("Analytics", "Amazon Redshift"),
-    "Athena":          ("Analytics", "Amazon Athena"),
-    "Glue":            ("Analytics", "AWS Glue"),
-    "CloudFront":      ("Networking", "Amazon CloudFront"),
-    "VPC":             ("Networking", "Amazon Virtual Private Cloud"),
-    "Route53":         ("Networking", "Amazon Route 53"),
-    "ELB":             ("Networking", "Elastic Load Balancing"),
-    "NAT":             ("Networking", "AWS NAT Gateway"),
-    "APIGateway":      ("Networking", "Amazon API Gateway"),
-    "SNS":             ("Integration", "Amazon Simple Notification Service"),
-    "SQS":             ("Integration", "Amazon Simple Queue Service"),
-    "KMS":             ("Security", "AWS Key Management Service"),
-    "SecretsManager":  ("Security", "AWS Secrets Manager"),
-    "CloudWatch":      ("Management and Governance", "Amazon CloudWatch"),
-    "CloudTrail":      ("Management and Governance", "AWS CloudTrail"),
+# Minimal provider-specific mapping from resource types to FOCUS-defined
+# (ServiceCategory, ServiceName) tuples. FOCUS v1.3 defines a fixed set of
+# ServiceCategory values (see spec §3.1.55). Extend this table to cover the
+# resource types produced by your Attribute integration.
+RESOURCE_TYPE_MAP: dict[str, dict[str, tuple[str, str]]] = {
+    "AWS": {
+        "EC2": ("Compute", "Amazon Elastic Compute Cloud"),
+        "EKS": ("Compute", "Amazon Elastic Kubernetes Service"),
+        "ECS": ("Compute", "Amazon Elastic Container Service"),
+        "Lambda": ("Compute", "AWS Lambda"),
+        "Fargate": ("Compute", "AWS Fargate"),
+        "S3": ("Storage", "Amazon Simple Storage Service"),
+        "EBS": ("Storage", "Amazon Elastic Block Store"),
+        "EFS": ("Storage", "Amazon Elastic File System"),
+        "RDS": ("Databases", "Amazon Relational Database Service"),
+        "DynamoDB": ("Databases", "Amazon DynamoDB"),
+        "ElastiCache": ("Databases", "Amazon ElastiCache"),
+        "Redshift": ("Analytics", "Amazon Redshift"),
+        "Athena": ("Analytics", "Amazon Athena"),
+        "Glue": ("Analytics", "AWS Glue"),
+        "CloudFront": ("Networking", "Amazon CloudFront"),
+        "VPC": ("Networking", "Amazon Virtual Private Cloud"),
+        "Route53": ("Networking", "Amazon Route 53"),
+        "ELB": ("Networking", "Elastic Load Balancing"),
+        "NAT": ("Networking", "AWS NAT Gateway"),
+        "APIGateway": ("Networking", "Amazon API Gateway"),
+        "SNS": ("Integration", "Amazon Simple Notification Service"),
+        "SQS": ("Integration", "Amazon Simple Queue Service"),
+        "KMS": ("Security", "AWS Key Management Service"),
+        "SecretsManager": ("Security", "AWS Secrets Manager"),
+        "CloudWatch": ("Management and Governance", "Amazon CloudWatch"),
+        "CloudTrail": ("Management and Governance", "AWS CloudTrail"),
+    },
+    "GCP": {
+        "GKE": ("Compute", "Google Kubernetes Engine"),
+        "ComputeEngine": ("Compute", "Google Compute Engine"),
+        "Compute Engine": ("Compute", "Google Compute Engine"),
+        "CloudRun": ("Compute", "Google Cloud Run"),
+        "Cloud Run": ("Compute", "Google Cloud Run"),
+        "CloudFunctions": ("Compute", "Google Cloud Functions"),
+        "Cloud Functions": ("Compute", "Google Cloud Functions"),
+        "CloudStorage": ("Storage", "Google Cloud Storage"),
+        "Cloud Storage": ("Storage", "Google Cloud Storage"),
+        "PersistentDisk": ("Storage", "Google Persistent Disk"),
+        "Filestore": ("Storage", "Google Cloud Filestore"),
+        "CloudSQL": ("Databases", "Google Cloud SQL"),
+        "Cloud SQL": ("Databases", "Google Cloud SQL"),
+        "Spanner": ("Databases", "Google Cloud Spanner"),
+        "Bigtable": ("Databases", "Google Cloud Bigtable"),
+        "Memorystore": ("Databases", "Google Cloud Memorystore"),
+        "BigQuery": ("Analytics", "Google BigQuery"),
+        "Dataflow": ("Analytics", "Google Cloud Dataflow"),
+        "Dataproc": ("Analytics", "Google Cloud Dataproc"),
+        "PubSub": ("Integration", "Google Cloud Pub/Sub"),
+        "Pub/Sub": ("Integration", "Google Cloud Pub/Sub"),
+        "LoadBalancing": ("Networking", "Google Cloud Load Balancing"),
+        "Load Balancing": ("Networking", "Google Cloud Load Balancing"),
+        "VPC": ("Networking", "Google Virtual Private Cloud"),
+        "CloudNAT": ("Networking", "Google Cloud NAT"),
+        "Cloud NAT": ("Networking", "Google Cloud NAT"),
+        "Interconnect": ("Networking", "Google Cloud Interconnect"),
+        "CloudDNS": ("Networking", "Google Cloud DNS"),
+        "Cloud DNS": ("Networking", "Google Cloud DNS"),
+        "CloudLogging": ("Management and Governance", "Google Cloud Logging"),
+        "Cloud Monitoring": ("Management and Governance", "Google Cloud Monitoring"),
+    },
+    "AZURE": {
+        "VirtualMachines": ("Compute", "Azure Virtual Machines"),
+        "Virtual Machines": ("Compute", "Azure Virtual Machines"),
+        "VMScaleSets": ("Compute", "Azure Virtual Machine Scale Sets"),
+        "VM Scale Sets": ("Compute", "Azure Virtual Machine Scale Sets"),
+        "AKS": ("Compute", "Azure Kubernetes Service"),
+        "Functions": ("Compute", "Azure Functions"),
+        "AppService": ("Compute", "Azure App Service"),
+        "App Service": ("Compute", "Azure App Service"),
+        "ManagedDisks": ("Storage", "Azure Managed Disks"),
+        "Managed Disks": ("Storage", "Azure Managed Disks"),
+        "BlobStorage": ("Storage", "Azure Blob Storage"),
+        "Blob Storage": ("Storage", "Azure Blob Storage"),
+        "Files": ("Storage", "Azure Files"),
+        "Azure Files": ("Storage", "Azure Files"),
+        "AzureSQL": ("Databases", "Azure SQL Database"),
+        "Azure SQL": ("Databases", "Azure SQL Database"),
+        "SQLDatabase": ("Databases", "Azure SQL Database"),
+        "CosmosDB": ("Databases", "Azure Cosmos DB"),
+        "Cosmos DB": ("Databases", "Azure Cosmos DB"),
+        "PostgreSQL": ("Databases", "Azure Database for PostgreSQL"),
+        "MySQL": ("Databases", "Azure Database for MySQL"),
+        "Redis": ("Databases", "Azure Cache for Redis"),
+        "LoadBalancer": ("Networking", "Azure Load Balancer"),
+        "Load Balancer": ("Networking", "Azure Load Balancer"),
+        "ApplicationGateway": ("Networking", "Azure Application Gateway"),
+        "Application Gateway": ("Networking", "Azure Application Gateway"),
+        "VirtualNetwork": ("Networking", "Azure Virtual Network"),
+        "Virtual Network": ("Networking", "Azure Virtual Network"),
+        "NATGateway": ("Networking", "Azure NAT Gateway"),
+        "NAT Gateway": ("Networking", "Azure NAT Gateway"),
+        "ExpressRoute": ("Networking", "Azure ExpressRoute"),
+        "ServiceBus": ("Integration", "Azure Service Bus"),
+        "Service Bus": ("Integration", "Azure Service Bus"),
+        "EventHubs": ("Integration", "Azure Event Hubs"),
+        "Event Hubs": ("Integration", "Azure Event Hubs"),
+        "Monitor": ("Management and Governance", "Azure Monitor"),
+        "LogAnalytics": ("Management and Governance", "Azure Log Analytics"),
+        "Defender": ("Security", "Microsoft Defender for Cloud"),
+        "KeyVault": ("Security", "Azure Key Vault"),
+        "Key Vault": ("Security", "Azure Key Vault"),
+    },
 }
-DEFAULT_CATEGORY = "Other"
 
 
-def classify_service(cloud_provider: str, resource_type: Optional[str]) -> tuple[str, str]:
-    """Return a (ServiceCategory, ServiceName) pair for a given resource type."""
-    if not resource_type:
-        return DEFAULT_CATEGORY, cloud_provider or "Unknown"
-    mapped = RESOURCE_TYPE_MAP.get(resource_type)
-    if mapped:
-        return mapped
-    # Unknown type: preserve the raw resource_type as the service name so the
-    # output is still informative, and flag it as Other.
-    return DEFAULT_CATEGORY, resource_type
+def _normalize_key(value: str) -> str:
+    """Return a compact key for loose resource-type matching."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+NORMALIZED_RESOURCE_TYPE_MAP: dict[str, dict[str, tuple[str, str]]] = {
+    provider: {_normalize_key(k): v for k, v in mapping.items()}
+    for provider, mapping in RESOURCE_TYPE_MAP.items()
+}
+
+
+def normalize_provider(raw_provider: Optional[str]) -> str:
+    """Normalize provider aliases into stable values."""
+    value = (raw_provider or "").strip()
+    key = _normalize_key(value)
+    if key in {"aws", "amazonwebservices", "amazon"}:
+        return "AWS"
+    if key in {"gcp", "googlecloudplatform", "googlecloud"}:
+        return "GCP"
+    if key in {"azure", "microsoftazure"}:
+        return "AZURE"
+    return value.upper() if value else "Unknown"
+
+
+def normalize_region(provider: str, raw_region: Optional[str]) -> tuple[str, str]:
+    """
+    Return (RegionId, RegionName). For now this is intentionally conservative:
+    preserve the raw value while tidying whitespace. Provider hooks are here so
+    the mapping can be refined later without touching row generation.
+    """
+    value = (raw_region or "").strip()
+    if not value:
+        return "", ""
+    if provider == "AZURE":
+        # Azure regions are often display names ("East US") rather than ids.
+        return value, value
+    if provider == "GCP":
+        # GCP may use regions or multi-regions like "us-central1" or "US".
+        return value, value
+    return value, value
+
+
+def infer_subaccount_type(provider: str) -> str:
+    if provider == "AWS":
+        return "Account"
+    if provider == "GCP":
+        return "Project"
+    if provider == "AZURE":
+        return "Subscription"
+    return DEFAULT_SUBACCOUNT_TYPE
+
+
+def classify_service(
+    cloud_provider: str,
+    resource_type: Optional[str],
+    resource_name: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return a provider-aware (ServiceCategory, ServiceName) tuple."""
+    provider = normalize_provider(cloud_provider)
+    if resource_type:
+        normalized_resource_type = _normalize_key(resource_type)
+        mapped = NORMALIZED_RESOURCE_TYPE_MAP.get(provider, {}).get(
+            normalized_resource_type
+        )
+        if mapped:
+            return mapped
+
+    # Fallback: preserve raw resource type first, then resource name, then provider.
+    if resource_type:
+        return DEFAULT_CATEGORY, resource_type
+    if resource_name:
+        return DEFAULT_CATEGORY, resource_name
+    return DEFAULT_CATEGORY, provider or "Unknown"
+
+
+def map_account_fields(provider: str, resource: dict[str, Any]) -> dict[str, str]:
+    """
+    Map available account-like identifiers into FOCUS billing/subaccount fields.
+    Attribute currently exposes a single accountId in this feed, so we reuse it
+    for both BillingAccountId and SubAccountId until richer fields are available.
+    """
+    account_id = str(resource.get("accountId") or "")
+    account_name = str(resource.get("accountName") or "")
+    return {
+        "BillingAccountId": account_id,
+        "BillingAccountName": account_name,
+        "SubAccountId": account_id,
+        "SubAccountName": account_name,
+        "SubAccountType": infer_subaccount_type(provider) if account_id else "",
+    }
+
+
+def map_resource_fields(provider: str, resource: dict[str, Any]) -> dict[str, str]:
+    """
+    Map raw resource information into FOCUS resource and region fields.
+    Prefer explicit ids when present; otherwise fall back to resourceName.
+    """
+    raw_region = resource.get("resourceRegion") or resource.get("region") or ""
+    region_id, region_name = normalize_region(provider, str(raw_region))
+
+    resource_id = (
+        resource.get("resourceId")
+        or resource.get("id")
+        or resource.get("fullResourceName")
+        or resource.get("resourceName")
+        or ""
+    )
+    resource_name = str(resource.get("resourceName") or "")
+    resource_type = str(resource.get("resourceType") or "")
+
+    return {
+        "RegionId": region_id,
+        "RegionName": region_name,
+        "ResourceId": str(resource_id),
+        "ResourceName": resource_name,
+        "ResourceType": resource_type,
+    }
 
 
 def period_bounds(date_str: str, granularity: str) -> tuple[str, str]:
@@ -318,20 +504,23 @@ def entries_to_focus_rows(
 
             amortized = _to_float(cost.get("amortizedCost"))
 
-            cloud_provider = resource.get("cloudProvider") or ""
-            account_id = resource.get("accountId") or ""
-            resource_name = resource.get("resourceName") or ""
-            resource_type = resource.get("resourceType") or ""
-            resource_region = resource.get("resourceRegion") or ""
-            rule_id = resource.get("customerRuleIdentifier") or ""
+            provider = normalize_provider(resource.get("cloudProvider"))
+            resource_name = str(resource.get("resourceName") or "")
+            resource_type = str(resource.get("resourceType") or "")
+            rule_id = str(resource.get("customerRuleIdentifier") or "")
 
-            service_category, service_name = classify_service(cloud_provider, resource_type)
+            service_category, service_name = classify_service(
+                provider,
+                resource_type,
+                resource_name,
+            )
+            account_fields = map_account_fields(provider, resource)
+            resource_fields = map_resource_fields(provider, resource)
 
             yield {
                 # Mandatory
                 "BilledCost":         amortized,
-                "BillingAccountId":   account_id,
-                "BillingAccountName": "",   # Not provided by Attribute
+                **account_fields,
                 "BillingCurrency":    currency,
                 "BillingPeriodEnd":   billing_period_end,
                 "BillingPeriodStart": billing_period_start,
@@ -344,25 +533,18 @@ def entries_to_focus_rows(
                 "ChargePeriodStart":  billing_period_start,
                 "ContractedCost":     amortized,  # Attribute does not distinguish
                 "EffectiveCost":      amortized,
-                "HostProviderName":   cloud_provider,
-                "InvoiceIssuerName":  cloud_provider,
+                "HostProviderName":   provider,
+                "InvoiceIssuerName":  provider,
                 "ListCost":           amortized,  # Attribute does not distinguish
                 "PricingQuantity":    "",   # Not provided
                 "PricingUnit":        "",   # Not provided
-                "ProviderName":       cloud_provider,   # Deprecated, still mandatory
-                "PublisherName":      cloud_provider,   # Deprecated, still mandatory
+                "ProviderName":       provider,   # Deprecated, still mandatory
+                "PublisherName":      provider,   # Deprecated, still mandatory
                 "ServiceCategory":    service_category,
                 "ServiceName":        service_name,
-                "ServiceProviderName": cloud_provider,
+                "ServiceProviderName": provider,
                 # Conditional / recommended
-                "RegionId":           resource_region,
-                "RegionName":         resource_region,
-                "ResourceId":         resource_name,
-                "ResourceName":       resource_name,
-                "ResourceType":       resource_type,
-                "SubAccountId":       account_id,
-                "SubAccountName":     "",
-                "SubAccountType":     "",
+                **resource_fields,
                 # Custom (FOCUS §2.8)
                 "x_CustomerName":            customer_name,
                 "x_CustomerRuleIdentifier":  rule_id,

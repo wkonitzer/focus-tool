@@ -83,6 +83,8 @@ FOCUS_COLUMNS: list[str] = [
     "ListCost",
     "PricingQuantity",
     "PricingUnit",
+    "ProviderName",   # Deprecated in v1.2, still Mandatory per v1.3 spec §3.1.47
+    "PublisherName",  # Deprecated in v1.2, still Mandatory per v1.3 spec §3.1.48
     "ServiceCategory",
     "ServiceName",
     "ServiceProviderName",
@@ -338,6 +340,8 @@ def entries_to_focus_rows(
                 "ListCost":           amortized,  # Attribute does not distinguish
                 "PricingQuantity":    "",   # Not provided
                 "PricingUnit":        "",   # Not provided
+                "ProviderName":       cloud_provider,   # Deprecated, still mandatory
+                "PublisherName":      cloud_provider,   # Deprecated, still mandatory
                 "ServiceCategory":    service_category,
                 "ServiceName":        service_name,
                 "ServiceProviderName": cloud_provider,

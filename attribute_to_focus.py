@@ -250,6 +250,14 @@ def normalize_provider(raw_provider: Optional[str]) -> str:
     return value.upper() if value else "Unknown"
 
 
+def normalize_provider_filter(raw_provider_filter: str) -> Optional[str]:
+    """Return a normalized provider filter, or None for 'all'."""
+    value = (raw_provider_filter or "all").strip()
+    if _normalize_key(value) == "all":
+        return None
+    return normalize_provider(value)
+
+
 def normalize_region(provider: str, raw_region: Optional[str]) -> tuple[str, str]:
     """
     Return (RegionId, RegionName). For now this is intentionally conservative:
@@ -492,6 +500,7 @@ def entries_to_focus_rows(
     billing_period_start: str,
     billing_period_end: str,
     currency: str,
+    provider_filter: Optional[str] = None,
     debug: bool = False,
     debug_log: Optional[Callable[[str], None]] = None,    
 ) -> Iterator[dict[str, Any]]:
@@ -530,6 +539,14 @@ def entries_to_focus_rows(
                 )
 
             provider = normalize_provider(resource.get("cloudProvider"))
+            if provider_filter and provider != provider_filter:
+                if debug:
+                    debug_log(
+                        f"DEBUG skipping item for provider={provider!r}; "
+                        f"provider_filter={provider_filter!r}"
+                    )
+                continue
+
             resource_name = str(resource.get("resourceName") or "")
             resource_type = str(resource.get("resourceType") or "")
             rule_id = str(resource.get("customerRuleIdentifier") or "")
@@ -646,6 +663,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Max seconds to wait for job completion (default: 600).")
     p.add_argument("--debug", action="store_true",
                    help="Print debug information about fetched entries and row conversion.")
+    p.add_argument("--provider", choices=("aws", "gcp", "azure", "all"), default="all",
+                   help=(
+                       "Filter output to a single cloud provider or include all providers "
+                       "(default: all)."
+                    )
+    )    
     return p
 
 
@@ -658,7 +681,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "parquet": "focus.parquet",
     }
     if args.out is None:
-        args.out = default_out_by_format[args.format]    
+        args.out = default_out_by_format[args.format]
+
+    provider_filter = normalize_provider_filter(args.provider)
 
     if not args.token:
         print("ERROR: provide --token or set ATTRIBUTE_API_TOKEN.", file=sys.stderr)
@@ -718,6 +743,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             billing_period_start=start,
             billing_period_end=end,
             currency=args.currency,
+            provider_filter=provider_filter,
             debug=args.debug,
             debug_log=lambda msg: print(msg, file=sys.stderr),
         )

@@ -12,7 +12,6 @@ it into the FinOps Open Cost and Usage Specification (FOCUS) v1.3 format.
 - [Usage](#usage)
 - [Mapping Decisions](#mapping)
 - [Contributing](#contributing)
-- [License](#license)
 
 ## Installation
 
@@ -50,11 +49,11 @@ ython3 attribute_to_focus.py --date 2026-04-01 --granularity monthly --format js
 ```
 
 ## Mapping
-- amortizedCost → EffectiveCost is the clean mapping. FOCUS also requires BilledCost, ContractedCost, and ListCost, which the Attribute API doesn't expose separately — the script writes the same value to all four. If you need true billed/list costs, you'll want to join this output with the raw CUR.
-- cloudProvider is written to ServiceProviderName, HostProviderName, and InvoiceIssuerName — all three are mandatory in FOCUS, and for direct-from-AWS attribution they're the same entity.
-- ChargeCategory is hard-coded to "Usage" since Attribute's customer data represents consumption attribution; if you start pulling in purchases/credits elsewhere, you'd map those separately.
-- ServiceCategory/ServiceName need FOCUS-defined values (not raw "EKS"), so there's a lookup table — extend RESOURCE_TYPE_MAP as you encounter resource types not yet listed.
-- customerName, customerRuleIdentifier, and organizationId go into x_-prefixed custom columns per FOCUS §2.8.
+- `amortizedCost` → `EffectiveCost` is the clean mapping. FOCUS also requires `BilledCost`, `ContractedCost`, and `ListCost`, which the Attribute API doesn't expose separately — the script writes the same value to all four. 
+- `cloudProvider` is written to `ServiceProviderName`, `HostProviderName`, and `InvoiceIssuerName` — all three are mandatory in FOCUS, and for direct-from-AWS attribution they're the same entity.
+- `ChargeCategory` is hard-coded to `"Usage"`` since Attribute's customer data represents consumption attribution; if you start pulling in purchases/credits elsewhere, you'd map those separately.
+- `ServiceCategory/ServiceName` need FOCUS-defined values (not raw "EKS"), so there's a lookup table — extend `RESOURCE_TYPE_MAP` as you encounter resource types not yet listed.
+- `customerName`, `customerRuleIdentifier`, and `organizationId` go into `x_`-prefixed custom columns per FOCUS §2.8.
 
 One caveat to keep in mind: the AWS 48-hour data-availability delay mentioned in the Attribute docs means the script will emit empty results for dates less than two days old, which isn't an error — just a reminder.
 

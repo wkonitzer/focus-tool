@@ -25,6 +25,11 @@ this script populates all four columns with `amortizedCost`. Downstream
 consumers that need true billed or list costs should join this output with
 the original cloud provider billing export.
 
+Attribute measures actual attributed usage cost, so `ChargeCategory` is
+emitted as `Usage`. However, because the Attribute API does not currently
+expose pricing quantity or pricing unit, this export is not yet fully
+validator-compliant with strict FOCUS requirements.
+
 Customer identifiers have no native column in FOCUS, so they are emitted as
 custom columns (`x_CustomerName`, `x_CustomerRuleIdentifier`,
 `x_OrganizationId`) per FOCUS section 2.8 (Custom Columns).

@@ -492,17 +492,42 @@ def entries_to_focus_rows(
     billing_period_start: str,
     billing_period_end: str,
     currency: str,
+    debug: bool = False,
+    debug_log: Optional[Callable[[str], None]] = None,    
 ) -> Iterator[dict[str, Any]]:
     """Flatten CustomerEntryObject records into one FOCUS row per attribution."""
-    for entry in entries:
-        customer_name = entry.get("customerName") or ""
-        organization_id = entry.get("organizationId") or ""
+    if debug_log is None:
+        debug_log = lambda _msg: None
 
-        for item in entry.get("data") or []:
+    for entry in entries:
+        customer_name = str(entry.get("customerName") or "")
+        organization_id = str(entry.get("organizationId") or "")
+        entry_data = entry.get("data") or []
+
+        if debug:
+            debug_log(
+                f"DEBUG entry customer={customer_name!r} organization_id={organization_id!r} "
+                f"data_len={len(entry_data)} keys={sorted(entry.keys())}"
+            )
+            if not entry_data:
+                debug_log(
+                    f"DEBUG entry has no data items for customer={customer_name!r}"
+                )
+
+        for item in entry_data:
             resource = item.get("resource") or {}
             cost = item.get("cost") or {}
 
             amortized = _to_float(cost.get("amortizedCost"))
+
+            if debug:
+                debug_log(
+                    "DEBUG item "
+                    f"resource_type={resource.get('resourceType')!r} "
+                    f"resource_name={resource.get('resourceName')!r} "
+                    f"provider={resource.get('cloudProvider')!r} "
+                    f"amortized_cost={cost.get('amortizedCost')!r}"
+                )
 
             provider = normalize_provider(resource.get("cloudProvider"))
             resource_name = str(resource.get("resourceName") or "")
@@ -619,6 +644,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Seconds between job status polls (default: 3).")
     p.add_argument("--poll-timeout", type=float, default=600.0,
                    help="Max seconds to wait for job completion (default: 600).")
+    p.add_argument("--debug", action="store_true",
+                   help="Print debug information about fetched entries and row conversion.")
     return p
 
 
@@ -659,12 +686,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         client.wait_for_job(job_id)
 
         print("Job completed. Streaming results and converting to FOCUS...", file=sys.stderr)
-        entries = client.fetch_results(job_id, page_size=args.page_size)
+        entries = list(client.fetch_results(job_id, page_size=args.page_size))
+
+        if args.debug:
+            print(f"DEBUG fetched {len(entries)} top-level entries", file=sys.stderr)
+            for i, entry in enumerate(entries[:5]):
+                entry_data = entry.get("data") or []
+                print(
+                    f"DEBUG entry[{i}] customerName={entry.get('customerName')!r} "
+                    f"organizationId={entry.get('organizationId')!r} "
+                    f"data_len={len(entry_data)} keys={sorted(entry.keys())}",
+                    file=sys.stderr,
+                )
+                if entry_data:
+                    first_item = entry_data[0] or {}
+                    print(
+                        f"DEBUG entry[{i}] first_item_keys={sorted(first_item.keys())}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"DEBUG entry[{i}] first_resource_keys={sorted((first_item.get('resource') or {}).keys())}",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"DEBUG entry[{i}] first_cost_keys={sorted((first_item.get('cost') or {}).keys())}",
+                        file=sys.stderr,
+                    )
+
         rows = entries_to_focus_rows(
             entries,
             billing_period_start=start,
             billing_period_end=end,
             currency=args.currency,
+            debug=args.debug,
+            debug_log=lambda msg: print(msg, file=sys.stderr),
         )
 
         if args.format == "csv":
@@ -679,6 +734,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     except TimeoutError as e:
         print(f"Timeout: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(f"Runtime error: {e}", file=sys.stderr)
         return 1
 
     print(f"Wrote {n} FOCUS rows to {args.out}", file=sys.stderr)

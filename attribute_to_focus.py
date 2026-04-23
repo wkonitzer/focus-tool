@@ -445,7 +445,7 @@ class AttributeClient:
                 "allcustomers": ("true" if allcustomers else None),
             }
         elif source in {"resources", "workloads"}:
-            path = f"/api/v1/reports/{source}/{granularity}/{date}"
+            path = f"/api/v1/{source}/{granularity}/{date}"
             params = {}
         else:
             raise ValueError(f"Unsupported source: {source!r}")
